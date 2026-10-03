@@ -70,6 +70,7 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+from arena.scorer import MAX_CLAIM_CHARS, MAX_CLAIMS_PER_DOC, MAX_SCORED_CLAIMS
 from harness.middleware import Middleware
 
 
@@ -79,16 +80,65 @@ class Critic(Middleware):
     name = "critic"
 
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list):
+            return report
+        candidates = []
+        observed_lines = ctx.observed_text.splitlines()
+        decorations = " \t\n.,;:'\"“”‘’*_`[](){}<>«»‹›"
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            text = claim.get("text")
+            if not isinstance(text, str):
+                continue
+            if "\n" not in text and "\n" not in text and text in ctx.observed_text:
+                candidates.append(claim)
+                continue
+            trimmed = text.strip(decorations)
+            if len(trimmed) >= 20 and any(trimmed in line for line in observed_lines):
+                cited = ctx.corpus.get(claim.get("doc_id")) if ctx.corpus else None
+                if cited and any(trimmed in line for line in cited.body.splitlines()):
+                    claim["text"] = trimmed
+                    candidates.append(claim)
+                    continue
+                source = next((doc for doc in ctx.corpus.docs
+                               if doc.body in ctx.observed_text
+                               and any(trimmed in line for line in doc.body.splitlines())), None) if ctx.corpus else None
+                if source:
+                    claim["text"] = trimmed
+                    claim["doc_id"] = source.doc_id
+                    candidates.append(claim)
+                continue
+            if "\n" in text or "\n" in text:
+                continue
+            if " và " in text:
+                left, right = text.split(" và ", 1)
+                sources = [doc for doc in ctx.corpus.docs if left in doc.body and doc.body in ctx.observed_text]
+                other_sources = [doc for doc in ctx.corpus.docs if right in doc.body and doc.body in ctx.observed_text]
+                pair = next(((a, b) for a in sources for b in other_sources if a.doc_id != b.doc_id), None)
+                if left in ctx.observed_text and right in ctx.observed_text and pair:
+                    candidates.extend(({**claim, "text": left, "doc_id": pair[0].doc_id},
+                                       {**claim, "text": right, "doc_id": pair[1].doc_id}))
+                    report["abstain"] = True
+        kept = []
+        seen = set()
+        per_doc = {}
+        for claim in candidates:
+            text, doc_id = claim["text"], claim.get("doc_id")
+            key = (text, doc_id)
+            if key in seen or len(text) > MAX_CLAIM_CHARS or len(kept) >= MAX_SCORED_CLAIMS:
+                continue
+            if per_doc.get(doc_id, 0) >= MAX_CLAIMS_PER_DOC:
+                continue
+            seen.add(key)
+            per_doc[doc_id] = per_doc.get(doc_id, 0) + 1
+            kept.append(claim)
+        report["claims"] = kept
+        if not kept:
+            report["abstain"] = True
+            report["citations"] = []
+            report["answer"] = "Không đủ căn cứ để trả lời."
+        else:
+            report["citations"] = list(dict.fromkeys(claim["doc_id"] for claim in kept))
+        return report

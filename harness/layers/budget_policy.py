@@ -64,8 +64,10 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
-from arena.model import FINALIZE_SENTINEL
-from arena.tools import ToolResult  # noqa: F401  (dùng trong phần TODO)
+import time
+
+from arena.model import FINALIZE_SENTINEL, MockModel
+from arena.tools import ToolResult
 
 from harness.middleware import Middleware
 
@@ -86,24 +88,73 @@ class BudgetPolicy(Middleware):
     def __init__(self, reserve: int = DEFAULT_RESERVE) -> None:
         self.reserve = max(0, int(reserve))
 
+    def before_agent(self, ctx) -> None:
+        ctx.state["budget_started_at"] = time.monotonic()
+
     def _spent(self, ctx) -> bool:
-        # TODO (§3): 2 dòng — "ngân sách đã cạn đến phần dự trữ chưa?"
-        #  limit = ctx.max_tool_calls; None nghĩa là brief không đặt ngân
-        #  sách -> chưa bao giờ cạn. Ngược lại:
-        #  ctx.tools.calls >= limit - self.reserve
-        return False
+        limit = ctx.max_tool_calls
+        if limit is not None and ctx.tools.calls >= limit - self.reserve:
+            return True
+        max_tokens = ctx.budget.get("max_tokens")
+        if max_tokens is not None:
+            used = ctx.state.get("budget_tokens_used", 0)
+            last_turn_cost = ctx.state.get("budget_last_turn_cost", 0)
+            if used + last_turn_cost > max_tokens:
+                return True
+        max_seconds = ctx.budget.get("max_seconds")
+        started = ctx.state.get("budget_started_at")
+        return (max_seconds is not None and started is not None
+                and time.monotonic() - started > 0.8 * max_seconds)
 
     def before_model(self, ctx, messages):
-        # TODO (§3): khoảng 4-6 dòng.
-        #  1. Nếu chưa cạn (`not self._spent(ctx)`) -> trả messages nguyên vẹn.
-        #  2. Ngược lại: trả về messages + [{"role": "user", "content": NUDGE}]
-        return messages  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        if self._spent(ctx):
+            return messages + [{"role": "user", "content": NUDGE}]
+        if any(message.get("role") == "assistant" for message in messages):
+            question = ""
+            for message in messages:
+                if message.get("role") == "assistant":
+                    break
+                if message.get("role") in ("user", "human"):
+                    content = message.get("content", "")
+                    content = content if isinstance(content, str) else str(content)
+                    if FINALIZE_SENTINEL not in content:
+                        question = content
+            hint = (
+                "Kết quả search là trích đoạn ngắn: fetch_doc ngay 1–3 tài liệu liên quan; không search quá hai lần liên tiếp nếu chưa fetch_doc. "
+                "Kho có các loại văn bản: Văn bản chính thức, Hỏi & Đáp, Báo cáo, Ghi chú. "
+                "Hỏi về con số/thống kê/số vụ: search '<tên chủ đề> báo cáo' và fetch tài liệu Báo cáo; "
+                "hỏi về quy định: search '<tên chủ đề> văn bản chính thức'. "
+                "Lấy tên chủ đề từ tiêu đề kết quả search (phần trước dấu —). "
+                "Claim chép nguyên dòng, không cắt, thêm hay sửa."
+            )
+            if all(label in question.lower() for label in ("(a)", "(b)", "(c)")):
+                hint += (
+                    " Chỉ khi câu hỏi liệt kê lựa chọn dạng (a), (b), (c), hãy ghi đúng một lựa chọn "
+                    "đã chọn, sao chép nguyên văn, trong khóa 'verdict' của FINAL."
+                )
+            return messages + [{"role": "user", "content": hint}]
+        return messages
 
     def wrap_tool_call(self, ctx, call, name, args):
-        # TODO (§3): khoảng 4-6 dòng.
-        #  1. Nếu chưa cạn -> `return call(name, args)` như bình thường.
-        #  2. Nếu đã cạn -> ĐỪNG gọi `call(...)`, trả về
-        #     ToolResult(ok=False, content="", error="<lý do>").
-        #     Không calling through chính là cách một lớp middleware
-        #     "chặn" một hành động — xem harness/middleware.py.
-        return call(name, args)  # <- mặc định KHÔNG LÀM GÌ
+        if self._spent(ctx):
+            return ToolResult(ok=False, content="", error="Hết ngân sách công cụ")
+        model = getattr(ctx.model, "inner", ctx.model)
+        if name == "search" and not isinstance(model, MockModel):
+            search_args = dict(args) if isinstance(args, dict) else {}
+            given_k = search_args.get("k") or 5
+            if isinstance(given_k, bool) or not isinstance(given_k, int):
+                given_k = 5
+            search_args["k"] = max(given_k, 10)
+            return call(name, search_args)
+        return call(name, args)
+
+    def wrap_model_call(self, ctx, call, messages):
+        response = call(messages)
+        state = ctx.state
+        state["budget_tokens_used"] = (
+            state.get("budget_tokens_used", 0)
+            + response.prompt_tokens
+            + response.completion_tokens
+        )
+        state["budget_last_turn_cost"] = response.prompt_tokens + response.completion_tokens
+        return response

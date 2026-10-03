@@ -104,11 +104,13 @@ you switch the addendum on, measure your own efficiency delta with
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 
 from arena.model import (
     ARENA_SYSTEM_PROMPT,
+    MockModel,
     TOOL_ERROR_PREFIX,
     parse_output,
 )
@@ -162,6 +164,11 @@ _PLACEHOLDER_RE = re.compile(r"\A[\s.…·\-–—]*\Z")
 #: (`arena.model._FINAL_RE`). Used ONLY to locate marker lines — every
 #: payload on this path is still decoded by `parse_output` itself.
 _FINAL_MARKER = "FINAL:"
+
+# `parse_output` remains the authority for whether a turn is an ACTION and
+# which tool it names. This second pass only recovers flat ACTION fields
+# that its intentionally strict args decoder does not retain.
+_ACTION_PAYLOAD_RE = re.compile(r"^ACTION:[ \t]*(.+)$", re.MULTILINE)
 
 # ---------------------------------------------------------------------------
 # The real-model prompt addendum
@@ -387,9 +394,30 @@ def _action_under_final(text: str):
     lines = text.split("\n")
     for index, line in enumerate(lines):
         if line.startswith(_FINAL_MARKER):
-            below = parse_output("\n".join(lines[index + 1:]))
+            below_text = "\n".join(lines[index + 1:])
+            below = _parse_action_args(below_text, parse_output(below_text))
             return below if below.kind == "action" else None
     return None
+
+
+def _parse_action_args(text: str, parsed):
+    """Recover top-level tool arguments while keeping parse_output in charge."""
+    if parsed.kind != "action":
+        return parsed
+    match = _ACTION_PAYLOAD_RE.search(text)
+    if match is None:
+        return parsed
+    try:
+        payload = json.loads(match.group(1))
+    except (TypeError, ValueError):
+        return parsed
+    if not isinstance(payload, dict) or payload.get("tool") != parsed.tool:
+        return parsed
+    args = parsed.args
+    if not args:
+        args = {key: value for key, value in payload.items() if key not in ("tool", "args")}
+    return type(parsed)(kind=parsed.kind, thought=parsed.thought,
+                        tool=parsed.tool, args=args, final=parsed.final)
 
 
 @dataclass
@@ -487,6 +515,9 @@ class ReActAgent:
         # belongs to the layers.
         self._final_deferrals = 0
         self._refused_final: dict | None = None
+        self._quote_completion_used = False
+        self._quote_completion_pending = False
+        self._quote_completion_prompt: str | None = None
 
     # -- the run -------------------------------------------------------
 
@@ -503,6 +534,9 @@ class ReActAgent:
         self.last_context = ctx
         self._final_deferrals = 0
         self._refused_final = None
+        self._quote_completion_used = False
+        self._quote_completion_pending = False
+        self._quote_completion_prompt = None
 
         self.trace.emit("agent_start", brief_id=str(brief.get("brief_id", "")))
 
@@ -530,6 +564,11 @@ class ReActAgent:
 
             parsed = self._parse(text)
             ctx.messages.append({"role": "assistant", "content": text})
+
+            if self._quote_completion_prompt is not None:
+                ctx.messages.append({"role": "user", "content": self._quote_completion_prompt})
+                self._quote_completion_prompt = None
+                continue
 
             if parsed.kind == "final":
                 report = parsed.final if isinstance(parsed.final, dict) else {}
@@ -591,17 +630,34 @@ class ReActAgent:
         submitted if the run ends without a real FINAL, so a guard can
         only buy a turn, never lose a report.
         """
-        parsed = parse_output(_canonicalise(text))
+        canonical_text = _canonicalise(text)
+        parsed = _parse_action_args(canonical_text, parse_output(canonical_text))
+        if self._quote_completion_pending:
+            self._quote_completion_pending = False
+            if parsed.kind != "final" or not _is_report_payload(parsed.final):
+                return type(parsed)(kind="final", final=dict(self._refused_final or {}))
         if parsed.kind != "final":
             return parsed
 
         if _is_report_payload(parsed.final):
             action = _action_under_final(text)
-            if action is None or self._final_deferrals >= MAX_FINAL_DEFERRALS:
-                return parsed
-            self._final_deferrals += 1
-            self._refused_final = parsed.final
-            return action
+            if action is not None and self._final_deferrals < MAX_FINAL_DEFERRALS:
+                self._final_deferrals += 1
+                self._refused_final = parsed.final
+                return action
+            missing_lines = self._quote_completion_lines(parsed.final)
+            if (missing_lines and not self._quote_completion_used
+                    and not self._is_mock_model() and self._budget_available()):
+                self._quote_completion_used = True
+                self._quote_completion_pending = True
+                self._refused_final = parsed.final
+                self._quote_completion_prompt = (
+                    "Hãy viết lại FINAL, chép nguyên văn đầy đủ từng dòng dưới đây vào claim tương ứng. "
+                    "Không cắt, không thêm hoặc sửa bất kỳ ký tự nào.\n"
+                    + "\n".join(missing_lines)
+                )
+                return type(parsed)(kind="quote_reask")
+            return parsed
 
         if isinstance(parsed.final, dict) and any(
             key in parsed.final for key in REPORT_KEYS
@@ -610,7 +666,53 @@ class ReActAgent:
         # Strict, NOT canonicalised: normalisation is what resurrects a
         # non-canonical marker such as `final: {}` in the first place, and
         # this path exists precisely to look underneath one.
-        return parse_output(_without_quoted_finals(text))
+        remaining = _without_quoted_finals(text)
+        return _parse_action_args(remaining, parse_output(remaining))
+
+    def _is_mock_model(self) -> bool:
+        return isinstance(self.model, MockModel) or isinstance(
+            getattr(self.model, "inner", None), MockModel
+        )
+
+    def _budget_available(self) -> bool:
+        if self.last_context is None:
+            return True
+        for layer in self.middleware:
+            if getattr(layer, "name", None) == "budget_policy" and callable(
+                getattr(layer, "_spent", None)
+            ):
+                return not layer._spent(self.last_context)
+        return True
+
+    def _quote_completion_lines(self, report: dict) -> list[str]:
+        ctx = self.last_context
+        if ctx is None or ctx.corpus is None:
+            return []
+        body_in_observation = ctx.observed_text
+        docs = getattr(ctx.corpus, "docs", ())
+        claims = report.get("claims")
+        if not isinstance(claims, list):
+            return []
+        requests = []
+        for index, claim in enumerate(claims):
+            if not isinstance(claim, dict):
+                continue
+            quote = claim.get("text")
+            if not isinstance(quote, str) or not quote:
+                continue
+            for doc in docs:
+                body = getattr(doc, "body", "")
+                if not isinstance(body, str) or body not in body_in_observation:
+                    continue
+                doc_id = getattr(doc, "doc_id", "")
+                line = next((line for line in body.splitlines()
+                             if quote in line and quote != line), None)
+                if line is not None:
+                    requests.append(
+                        f"Claim {index + 1} ({doc_id}): chép dòng đầy đủ sau: {line}"
+                    )
+                    break
+        return requests
 
     # -- the model -----------------------------------------------------
 
@@ -655,8 +757,14 @@ class ReActAgent:
                 "THOUGHT/ACTION hoặc THOUGHT/FINAL."
             )
 
+        args = dict(parsed.args)
+        if parsed.tool == "search" and not _as_text(args.get("query")).strip():
+            return (
+                f'{TOOL_ERROR_PREFIX} thiếu query; expected format '
+                'ACTION: {"tool": "search", "args": {"query": "...", "k": 5}}'
+            )
         call = self.middleware.wrap_tool_call(ctx, self._dispatch)
-        result = call(parsed.tool, dict(parsed.args))
+        result = call(parsed.tool, args)
         if result is None or not hasattr(result, "ok"):
             return f"{TOOL_ERROR_PREFIX} layer trả về kết quả không hợp lệ cho {parsed.tool}"
         return result.content if result.ok else f"{TOOL_ERROR_PREFIX} {result.error}"
